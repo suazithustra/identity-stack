@@ -123,8 +123,8 @@ remain subject to human review and provide or link to the upstream notes, old
 and new immutable identities, affected license obligations, compatibility
 evidence, migration impact, and rollback or restore disposition described
 above. Automation must not approve its own change or self-declare an untested
-tuple supported. Until corresponding dependency, build, test, release, and
-deployment tooling exists, this capability is inactive in Milestone 1;
-inventory, evidence, SBOM generation, and promotion remain explicit future
-gates rather than claimed active controls. The automation provider and schedule
-remain open decisions.
+tuple supported. Dependency-update tooling remains inactive. The local profile
+now has a pull-request compatibility workflow, exact upstream inventory, and a
+provisional evidence ledger; those controls do not provide dependency
+discovery, SBOM generation, release promotion, or automated approval. Those
+remain explicit future gates, and the update provider and schedule remain open.

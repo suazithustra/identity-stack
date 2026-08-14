@@ -1,1 +1,6 @@
 .compound-engineering/*.local.yaml
+deploy/local/.local-stack-credentials.env
+deploy/local/.local-stack-credentials.tmp.*
+deploy/local/.local-stack-state.json
+deploy/local/.local-stack-state.tmp.*
+deploy/local/.local-stack.lock/

@@ -5,8 +5,25 @@ authorization. It combines independently upgradeable upstream services with a
 small control plane while leaving product-domain ownership with consuming
 applications.
 
-The repository is currently establishing its documentation and architectural
-contracts. It does not yet contain a deployable stack.
+The repository currently includes its architectural contracts and a pinned,
+local-only Kratos and SpiceDB component fixture. It does not yet contain the
+control plane, a consuming application, or production deployment packaging.
+
+## Local component fixture
+
+With the documented prerequisites installed:
+
+```sh
+bin/local-stack init
+bin/local-stack up
+bin/local-stack smoke
+bin/local-stack status
+```
+
+Use the [local development runbook](docs/runbooks/local-development.md) for
+stop, reset, persistence, endpoint exposure, recovery, and evidence semantics.
+The fixture is not an authentication-ready, authorization-ready, production,
+or regulatory-compliance deployment.
 
 ## Start here
 
@@ -22,8 +39,8 @@ contracts. It does not yet contain a deployable stack.
 - [Security reporting](SECURITY.md) and the
   [threat-modeling process](docs/security/threat-modeling.md) explain how to
   report vulnerabilities and review security-sensitive changes.
-- The [current plan](docs/plans/2026-08-14-001-docs-repository-foundation-plan.md)
-  defines this foundation milestone, while the
+- The [current implementation plan](docs/plans/2026-08-14-0647-feat-pinned-local-development-environment-plan.md)
+  defines the local fixture milestone, while the
   [decision-provenance map](docs/project/handoff-authority-map.md) identifies
   the maintained authority for inherited decisions and deferrals.
 - The [definition of done](docs/project/definition-of-done.md) owns shared

@@ -1,0 +1,14 @@
+{
+  "schema_id": "local-smoke",
+  "state": "active",
+  "traits": {
+    "email": "local-smoke-u4@identity-stack.invalid"
+  },
+  "credentials": {
+    "password": {
+      "config": {
+        "password": "LOCAL_SMOKE_RUNTIME_PASSWORD"
+      }
+    }
+  }
+}

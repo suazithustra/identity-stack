@@ -1,0 +1,6 @@
+definition local_smoke_user {}
+
+definition local_smoke_document {
+  relation viewer: local_smoke_user
+  permission view = viewer
+}

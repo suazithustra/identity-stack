@@ -1,0 +1,245 @@
+name: identity-stack-local
+
+x-local-service: &local-service
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  networks:
+    - local-internal
+
+x-kratos-image: &kratos-image docker.io/oryd/kratos:v26.2.0@sha256:2a13bb8d362c7a7ae33bd7c0f5168aee46921f15c916a06346db91c06dc76643
+x-probe-image: &probe-image docker.io/curlimages/curl:8.21.0@sha256:7c12af72ceb38b7432ab85e1a265cff6ae58e06f95539d539b654f2cfa64bb13
+
+services:
+  kratos-migrate:
+    <<: *local-service
+    image: *kratos-image
+    command:
+      - migrate
+      - sql
+      - up
+      - --read-from-env
+      - --yes
+      - --config
+      - /etc/config/kratos/kratos.yaml
+    env_file:
+      - path: ./.local-stack-credentials.env
+        required: true
+    environment:
+      DSN: sqlite:///var/lib/sqlite/kratos.sqlite?_fk=true&mode=rwc
+      SPICEDB_GRPC_PRESHARED_KEY: ""
+    volumes:
+      - type: bind
+        source: ../../config/upstream/kratos/local/kratos.yaml
+        target: /etc/config/kratos/kratos.yaml
+        read_only: true
+      - type: bind
+        source: ../../tests/integration/local_stack/fixtures/kratos/local-smoke.identity.schema.json
+        target: /etc/config/kratos/local-smoke.identity.schema.json
+        read_only: true
+      - type: volume
+        source: kratos-sqlite
+        target: /var/lib/sqlite
+    tmpfs:
+      - /tmp:mode=0700
+      - /home/ory:uid=10000,gid=10000,mode=0700
+    labels:
+      dev.identity-stack.profile: local
+      dev.identity-stack.checkout: ${LOCAL_STACK_CHECKOUT_ID}
+      dev.identity-stack.config: ${LOCAL_STACK_CONFIG_IDENTITY}
+      dev.identity-stack.generation: ${LOCAL_STACK_STATE_GENERATION}
+      dev.identity-stack.role: migration
+    restart: "no"
+
+  kratos:
+    <<: *local-service
+    image: *kratos-image
+    command:
+      - serve
+      - --dev
+      - --sqa-opt-out
+      - --config
+      - /etc/config/kratos/kratos.yaml
+    env_file:
+      - path: ./.local-stack-credentials.env
+        required: true
+    environment:
+      DSN: sqlite:///var/lib/sqlite/kratos.sqlite?_fk=true&mode=rwc
+      SPICEDB_GRPC_PRESHARED_KEY: ""
+    depends_on:
+      kratos-migrate:
+        condition: service_completed_successfully
+        restart: true
+    ports:
+      - name: kratos-public
+        target: 4433
+        published: "4433"
+        host_ip: 127.0.0.1
+        protocol: tcp
+    expose:
+      - "4434"
+    volumes:
+      - type: bind
+        source: ../../config/upstream/kratos/local/kratos.yaml
+        target: /etc/config/kratos/kratos.yaml
+        read_only: true
+      - type: bind
+        source: ../../tests/integration/local_stack/fixtures/kratos/local-smoke.identity.schema.json
+        target: /etc/config/kratos/local-smoke.identity.schema.json
+        read_only: true
+      - type: volume
+        source: kratos-sqlite
+        target: /var/lib/sqlite
+    tmpfs:
+      - /tmp:mode=0700
+      - /home/ory:uid=10000,gid=10000,mode=0700
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - --quiet
+        - --output-document=/dev/null
+        - http://127.0.0.1:4434/health/ready
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 2s
+    labels:
+      dev.identity-stack.profile: local
+      dev.identity-stack.checkout: ${LOCAL_STACK_CHECKOUT_ID}
+      dev.identity-stack.config: ${LOCAL_STACK_CONFIG_IDENTITY}
+      dev.identity-stack.generation: ${LOCAL_STACK_STATE_GENERATION}
+      dev.identity-stack.role: identity
+    stop_grace_period: 10s
+
+  spicedb:
+    <<: *local-service
+    image: docker.io/authzed/spicedb:v1.56.0@sha256:c8a558a6cc1f9379fcdcab0171b623d65e7e5f95c998ebb7f937ca00a7c1598c
+    command:
+      - serve
+      - --datastore-engine=memory
+      - --grpc-addr=0.0.0.0:50051
+      - --http-enabled=true
+      - --http-addr=0.0.0.0:8443
+      - --metrics-enabled=false
+      - --telemetry-endpoint=
+      - --skip-release-check
+      - --log-format=json
+      - --log-level=info
+    env_file:
+      - path: ./.local-stack-credentials.env
+        required: true
+    environment:
+      SECRETS_CIPHER: ""
+      SECRETS_COOKIE: ""
+      SECRETS_PAGINATION: ""
+    ports:
+      - name: spicedb-grpc
+        target: 50051
+        published: "50051"
+        host_ip: 127.0.0.1
+        protocol: tcp
+    expose:
+      - "8443"
+    tmpfs:
+      - /tmp:mode=0700
+    labels:
+      dev.identity-stack.profile: local
+      dev.identity-stack.checkout: ${LOCAL_STACK_CHECKOUT_ID}
+      dev.identity-stack.config: ${LOCAL_STACK_CONFIG_IDENTITY}
+      dev.identity-stack.generation: ${LOCAL_STACK_STATE_GENERATION}
+      dev.identity-stack.role: authorization
+    stop_grace_period: 10s
+
+  local-stack-bootstrap:
+    <<: *local-service
+    image: *probe-image
+    entrypoint:
+      - /bin/sh
+      - -ec
+    command:
+      - |
+        umask 077
+        auth_config=$$(mktemp)
+        trap 'rm -f "$$auth_config"' EXIT HUP INT TERM
+        printf 'header = "Authorization: Bearer %s"\n' "$$SPICEDB_GRPC_PRESHARED_KEY" >"$$auth_config"
+        attempt=0
+        while :; do
+          readiness_status=000
+          if readiness_status=$$(curl --config "$$auth_config" --silent --output /dev/null \
+            --write-out '%{http_code}' --connect-timeout 2 --max-time 5 --request POST \
+            --header 'Content-Type: application/json' --data '{}' \
+            http://spicedb:8443/v1/schema/read); then
+            :
+          else
+            readiness_status=000
+          fi
+          case "$$readiness_status" in
+            200|404) break ;;
+          esac
+          attempt=$$((attempt + 1))
+          [ "$$attempt" -lt 45 ] || { printf '%s\n' 'SpiceDB readiness timed out.' >&2; exit 1; }
+          sleep 1
+        done
+        curl --config "$$auth_config" --silent --fail --output /dev/null \
+          --connect-timeout 2 --max-time 10 --request POST \
+          --header 'Content-Type: application/json' \
+          --data-binary @/fixtures/spicedb/schema.json \
+          http://spicedb:8443/v1/schema/write
+        curl --config "$$auth_config" --silent --fail --output /dev/null \
+          --connect-timeout 2 --max-time 10 --request POST \
+          --header 'Content-Type: application/json' \
+          --data-binary @/fixtures/spicedb/relationship.json \
+          http://spicedb:8443/v1/relationships/write
+    env_file:
+      - path: ./.local-stack-credentials.env
+        required: true
+    environment:
+      SECRETS_CIPHER: ""
+      SECRETS_COOKIE: ""
+      SECRETS_PAGINATION: ""
+    depends_on:
+      kratos:
+        condition: service_healthy
+        restart: true
+      spicedb:
+        condition: service_started
+        restart: true
+    volumes:
+      - type: bind
+        source: ../../tests/integration/local_stack/fixtures
+        target: /fixtures
+        read_only: true
+      - type: bind
+        source: ../../tests/integration/local_stack/smoke.sh
+        target: /smoke/smoke.sh
+        read_only: true
+    tmpfs:
+      - /tmp:uid=100,gid=101,mode=0700
+    labels:
+      dev.identity-stack.profile: local
+      dev.identity-stack.checkout: ${LOCAL_STACK_CHECKOUT_ID}
+      dev.identity-stack.config: ${LOCAL_STACK_CONFIG_IDENTITY}
+      dev.identity-stack.generation: ${LOCAL_STACK_STATE_GENERATION}
+      dev.identity-stack.role: bootstrap
+    restart: "no"
+
+networks:
+  local-internal:
+    internal: true
+    labels:
+      dev.identity-stack.profile: local
+      dev.identity-stack.checkout: ${LOCAL_STACK_CHECKOUT_ID}
+      dev.identity-stack.config: ${LOCAL_STACK_CONFIG_IDENTITY}
+      dev.identity-stack.generation: ${LOCAL_STACK_STATE_GENERATION}
+
+volumes:
+  kratos-sqlite:
+    labels:
+      dev.identity-stack.profile: local
+      dev.identity-stack.checkout: ${LOCAL_STACK_CHECKOUT_ID}
+      dev.identity-stack.config: ${LOCAL_STACK_CONFIG_IDENTITY}
+      dev.identity-stack.generation: ${LOCAL_STACK_STATE_GENERATION}
+      dev.identity-stack.data: kratos-sqlite

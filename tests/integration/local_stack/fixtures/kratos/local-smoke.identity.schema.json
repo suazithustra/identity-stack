@@ -1,0 +1,32 @@
+{
+  "$id": "https://identity-stack.invalid/schemas/local-smoke.identity.schema.json",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Local smoke identity",
+  "type": "object",
+  "properties": {
+    "traits": {
+      "type": "object",
+      "properties": {
+        "email": {
+          "type": "string",
+          "format": "email",
+          "ory.sh/kratos": {
+            "credentials": {
+              "password": {
+                "identifier": true
+              }
+            }
+          }
+        }
+      },
+      "required": [
+        "email"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "traits"
+  ],
+  "additionalProperties": false
+}

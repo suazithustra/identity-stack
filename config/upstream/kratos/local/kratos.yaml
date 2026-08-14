@@ -1,0 +1,26 @@
+version: v1.3.1
+
+dsn: sqlite:///var/lib/sqlite/kratos.sqlite?_fk=true&mode=rwc
+
+serve:
+  public:
+    base_url: http://127.0.0.1:4433/
+    cors:
+      enabled: false
+  admin:
+    base_url: http://kratos:4434/
+
+selfservice:
+  # Required by Kratos v26.2.0 configuration validation; no flow behavior is selected.
+  default_browser_return_url: http://127.0.0.1:4433/
+
+log:
+  level: info
+  format: json
+  leak_sensitive_values: false
+
+identity:
+  default_schema_id: local-smoke
+  schemas:
+    - id: local-smoke
+      url: file:///etc/config/kratos/local-smoke.identity.schema.json

@@ -1,0 +1,16 @@
+{
+  "consistency": {
+    "fullyConsistent": true
+  },
+  "resource": {
+    "objectType": "local_smoke_document",
+    "objectId": "fixture-document"
+  },
+  "permission": "view",
+  "subject": {
+    "object": {
+      "objectType": "local_smoke_user",
+      "objectId": "fixture-allowed"
+    }
+  }
+}

@@ -1,0 +1,3 @@
+{
+  "schema": "definition local_smoke_user {}\n\ndefinition local_smoke_document {\n  relation viewer: local_smoke_user\n  permission view = viewer\n}\n"
+}
