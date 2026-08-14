@@ -17,7 +17,9 @@ fail() {
 }
 
 require_fixture() {
-  [ -f "$1" ] && [ ! -L "$1" ] || fail "fixture is missing or unsafe: $1"
+  if [ ! -f "$1" ] || [ -L "$1" ]; then
+    fail "fixture is missing or unsafe: $1"
+  fi
 }
 
 request_status() {

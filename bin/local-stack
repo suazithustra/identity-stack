@@ -244,7 +244,9 @@ read_credential() {
 
 validate_local_path() {
   file=$1
-  [ -f "$file" ] && [ ! -L "$file" ] || fail "required local file is missing or unsafe: ${file#"$REPO_ROOT/"}"
+  if [ ! -f "$file" ] || [ -L "$file" ]; then
+    fail "required local file is missing or unsafe: ${file#"$REPO_ROOT/"}"
+  fi
   [ "$(file_mode "$file")" = 600 ] || fail "local file must have mode 600: ${file#"$REPO_ROOT/"}"
   [ "$(file_owner "$file")" = "$(id -u)" ] || fail "local file has the wrong owner: ${file#"$REPO_ROOT/"}"
 }
@@ -265,9 +267,10 @@ validate_credentials() {
   assert_value "$cookie" '^[A-Za-z0-9_-]{43}$' 'Kratos cookie secret'
   assert_value "$pagination" '^[A-Za-z0-9_-]{43}$' 'Kratos pagination secret'
   assert_value "$spicedb" '^[A-Za-z0-9_-]{43}$' 'SpiceDB preshared key'
-  [ "$cipher" != "$cookie" ] && [ "$cipher" != "$pagination" ] && [ "$cipher" != "$spicedb" ] &&
-    [ "$cookie" != "$pagination" ] && [ "$cookie" != "$spicedb" ] && [ "$pagination" != "$spicedb" ] ||
+  if [ "$cipher" = "$cookie" ] || [ "$cipher" = "$pagination" ] || [ "$cipher" = "$spicedb" ] ||
+    [ "$cookie" = "$pagination" ] || [ "$cookie" = "$spicedb" ] || [ "$pagination" = "$spicedb" ]; then
     fail 'local credential values are not distinct'
+  fi
 }
 
 validate_local_files() {
@@ -983,12 +986,18 @@ reset_stack() {
     fail 'volume remains after reset; local files were preserved'
 
   if [ "$credentials_present" -eq 1 ]; then
-    [ -f "$credentials" ] && [ ! -L "$credentials" ] || fail 'credential path changed during reset'
+    if [ ! -f "$credentials" ] || [ -L "$credentials" ]; then
+      fail 'credential path changed during reset'
+    fi
     unlink "$credentials"
   else
-    [ ! -e "$credentials" ] && [ ! -L "$credentials" ] || fail 'credential path changed during reset finalization'
+    if [ -e "$credentials" ] || [ -L "$credentials" ]; then
+      fail 'credential path changed during reset finalization'
+    fi
   fi
-  [ -f "$state" ] && [ ! -L "$state" ] || fail 'state path changed during reset'
+  if [ ! -f "$state" ] || [ -L "$state" ]; then
+    fail 'state path changed during reset'
+  fi
   unlink "$state"
   release_lock
   clear_lifecycle_traps
@@ -1043,10 +1052,13 @@ acquire_lock() {
   lock_owned=0
 
   if ! mkdir -m 700 "$lock_dir" 2>/dev/null; then
-    [ -d "$lock_dir" ] && [ ! -L "$lock_dir" ] || fail 'lifecycle lock path is unsafe'
+    if [ ! -d "$lock_dir" ] || [ -L "$lock_dir" ]; then
+      fail 'lifecycle lock path is unsafe'
+    fi
     entry_count=$(find "$lock_dir" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')
-    [ "$entry_count" = 1 ] && [ -f "$lock_owner" ] && [ ! -L "$lock_owner" ] ||
+    if [ "$entry_count" != 1 ] || [ ! -f "$lock_owner" ] || [ -L "$lock_owner" ]; then
       fail 'lifecycle lock is ambiguous; inspect it without deleting anything'
+    fi
     jq -e '
       type == "object" and
       (keys | sort) == ["acquired_at", "canonical_checkout", "config_identity", "ownership_token", "pid", "process_start_fingerprint", "state_generation"] and
@@ -1116,7 +1128,9 @@ initialize() {
   state="$REPO_ROOT/deploy/local/.local-stack-state.json"
   local_dir="$REPO_ROOT/deploy/local"
 
-  [ -d "$local_dir" ] && [ ! -L "$local_dir" ] || fail 'deploy/local must be an existing real directory'
+  if [ ! -d "$local_dir" ] || [ -L "$local_dir" ]; then
+    fail 'deploy/local must be an existing real directory'
+  fi
   for path in "$credentials" "$state"; do
     if [ -e "$path" ] || [ -L "$path" ]; then
       fail "refusing to overwrite or follow existing path: ${path#"$REPO_ROOT/"}"
@@ -1148,9 +1162,10 @@ initialize() {
   assert_value "$spicedb" '^[A-Za-z0-9_-]{43}$' 'SpiceDB preshared key'
   assert_value "$generation" '^[A-Za-z0-9_-]{43}$' 'state generation'
 
-  [ "$cipher" != "$cookie" ] && [ "$cipher" != "$pagination" ] && [ "$cipher" != "$spicedb" ] &&
-    [ "$cookie" != "$pagination" ] && [ "$cookie" != "$spicedb" ] && [ "$pagination" != "$spicedb" ] ||
+  if [ "$cipher" = "$cookie" ] || [ "$cipher" = "$pagination" ] || [ "$cipher" = "$spicedb" ] ||
+    [ "$cookie" = "$pagination" ] || [ "$cookie" = "$spicedb" ] || [ "$pagination" = "$spicedb" ]; then
     fail 'generated credential values unexpectedly collided'
+  fi
 
   credential_tmp=$(mktemp "$local_dir/.local-stack-credentials.tmp.XXXXXX")
   state_tmp=$(mktemp "$local_dir/.local-stack-state.tmp.XXXXXX")

@@ -15,7 +15,9 @@ read_key() {
   awk -F= '$1 == "SPICEDB_GRPC_PRESHARED_KEY" { count += 1; value = substr($0, length($1) + 2) } END { if (count != 1) exit 1; print value }' "$1"
 }
 
-[ -f "$credentials" ] && [ ! -L "$credentials" ] || fail 'pre-reset credentials are missing or unsafe'
+if [ ! -f "$credentials" ] || [ -L "$credentials" ]; then
+  fail 'pre-reset credentials are missing or unsafe'
+fi
 old_key=$(read_key "$credentials") || fail 'pre-reset SpiceDB key is missing or duplicated'
 
 "$ROOT_DIR/bin/local-stack" reset --yes
