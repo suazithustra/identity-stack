@@ -2,8 +2,10 @@
 
 Testing is organized around owned boundaries and evidence, not a pyramid of
 test counts. This policy defines the required layers and the evidence needed to
-support compatibility and security claims. It does not claim that an
-executable toolchain, service topology, or project test command exists yet.
+support compatibility and security claims. The repository currently has one
+approved executable boundary: the local Kratos and SpiceDB component fixture
+and its shell/CI checks. No application-wide test command or production profile
+exists yet.
 
 ## Layers and gates
 
@@ -74,9 +76,14 @@ inert values, environment separation, redaction, and accidental disclosure.
 
 ## Toolchain boundary
 
-The repository currently has no approved runtime, test harness, container
-orchestration command, or CI gate. Plans must name test layers and acceptance
-evidence, but must not invent commands to imply those controls exist. When a
-later milestone introduces a toolchain, it also documents the real local and
-automated commands, ownership, evidence retention, and which gates are
-blocking. Until then, review uses documentation and repository checks only.
+`bin/local-stack` and `tests/integration/local_stack/` are the approved local
+component-fixture interface and test harness. The pull-request workflow runs
+the same contract and real-component checks on its recorded runner tuple.
+Their evidence supports only the exact **local component-fixture
+compatibility** scope in the dependency ledger.
+
+There is still no control-plane, consuming-application, production,
+migration-upgrade, or release toolchain. Later milestones must document their
+real local and automated commands, ownership, retention, and blocking gates
+when they introduce them; do not infer those capabilities from the local
+fixture.

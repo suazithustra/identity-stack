@@ -1,0 +1,1236 @@
+#!/bin/sh
+
+set -eu
+
+MIN_COMPOSE_VERSION=2.35.0
+CHECK_TIMEOUT=10
+IMAGE_PULL_TIMEOUT=300
+MIGRATION_TIMEOUT=90
+KRATOS_READINESS_TIMEOUT=60
+SPICEDB_HEALTH_TIMEOUT=60
+BOOTSTRAP_TIMEOUT=45
+AGGREGATE_UP_TIMEOUT=600
+SMOKE_TIMEOUT=180
+DOWN_TIMEOUT=60
+RESET_TIMEOUT=120
+
+fail() {
+  printf 'local-stack: %s\n' "$1" >&2
+  exit "${2:-1}"
+}
+
+need_command() {
+  command -v "$1" >/dev/null 2>&1 || fail "required command is unavailable: $1"
+}
+
+reject_ambient_overrides() {
+  reject_if_set DOCKER_HOST "${DOCKER_HOST+x}"
+  reject_if_set DOCKER_CONTEXT "${DOCKER_CONTEXT+x}"
+  reject_if_set DOCKER_DEFAULT_PLATFORM "${DOCKER_DEFAULT_PLATFORM+x}"
+  reject_if_set COMPOSE_FILE "${COMPOSE_FILE+x}"
+  reject_if_set COMPOSE_PROJECT_NAME "${COMPOSE_PROJECT_NAME+x}"
+  reject_if_set COMPOSE_PROFILES "${COMPOSE_PROFILES+x}"
+  reject_if_set COMPOSE_ENV_FILES "${COMPOSE_ENV_FILES+x}"
+  reject_if_set COMPOSE_PATH_SEPARATOR "${COMPOSE_PATH_SEPARATOR+x}"
+  reject_if_set COMPOSE_IGNORE_ORPHANS "${COMPOSE_IGNORE_ORPHANS+x}"
+  reject_if_set COMPOSE_REMOVE_ORPHANS "${COMPOSE_REMOVE_ORPHANS+x}"
+  reject_if_set COMPOSE_EXPERIMENTAL "${COMPOSE_EXPERIMENTAL+x}"
+  reject_if_set SECRETS_CIPHER "${SECRETS_CIPHER+x}"
+  reject_if_set SECRETS_COOKIE "${SECRETS_COOKIE+x}"
+  reject_if_set SECRETS_PAGINATION "${SECRETS_PAGINATION+x}"
+  reject_if_set SPICEDB_GRPC_PRESHARED_KEY "${SPICEDB_GRPC_PRESHARED_KEY+x}"
+}
+
+reject_if_set() {
+  if [ "$2" = x ]; then
+    fail "ambient override is not allowed: $1"
+  fi
+}
+
+version_at_least() {
+  awk -v have="$1" -v want="$2" 'BEGIN {
+    split(have, h, "."); split(want, w, ".")
+    for (i = 1; i <= 3; i++) {
+      hv = h[i] + 0; wv = w[i] + 0
+      if (hv > wv) exit 0
+      if (hv < wv) exit 1
+    }
+    exit 0
+  }'
+}
+
+attest_local_docker() {
+  context=$(docker context show 2>/dev/null) || fail 'cannot resolve the Docker context'
+  [ -n "$context" ] || fail 'Docker returned an empty context name'
+
+  endpoint=$(docker context inspect "$context" 2>/dev/null | jq -er '.[0].Endpoints.docker.Host') ||
+    fail 'cannot inspect the Docker context endpoint'
+  case "$endpoint" in
+    unix://*) ;;
+    *) fail "Docker context is not a supported local Unix-socket context: $context" ;;
+  esac
+
+  compose_raw=$(docker compose version --short 2>/dev/null) || fail 'Docker Compose plugin is unavailable'
+  compose_version=$(printf '%s\n' "$compose_raw" | sed -E 's/^v?([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
+  printf '%s\n' "$compose_version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' ||
+    fail 'Docker Compose returned an unrecognized version'
+  version_at_least "$compose_version" "$MIN_COMPOSE_VERSION" ||
+    fail "Docker Compose $MIN_COMPOSE_VERSION or newer is required"
+}
+
+random_base64url() {
+  bytes=$1
+  openssl rand -base64 "$bytes" | tr -d '\n=' | tr '+/' '-_'
+}
+
+process_start_fingerprint() {
+  fingerprint=$(ps -o lstart= -p "$1" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/[[:space:]][[:space:]]*/ /g')
+  [ -n "$fingerprint" ] || return 1
+  printf '%s\n' "$fingerprint"
+}
+
+run_with_deadline() {
+  deadline_seconds=$1
+  shift
+  deadline_marker=$(mktemp "${TMPDIR:-/tmp}/identity-stack-deadline.XXXXXX")
+  : >"$deadline_marker"
+  (
+    set +e
+    "$@" &
+    deadline_child_pid=$!
+    trap 'kill -TERM "$deadline_child_pid" 2>/dev/null; wait "$deadline_child_pid" 2>/dev/null; exit 143' HUP INT TERM
+    wait "$deadline_child_pid"
+    child_status=$?
+    printf '%s\n' "$child_status" >"$deadline_marker"
+    exit "$child_status"
+  ) &
+  deadline_command_pid=$!
+  deadline_elapsed_tenths=0
+  deadline_limit_tenths=$((deadline_seconds * 10))
+  while [ ! -s "$deadline_marker" ] && [ "$deadline_elapsed_tenths" -lt "$deadline_limit_tenths" ]; do
+    sleep 0.1
+    deadline_elapsed_tenths=$((deadline_elapsed_tenths + 1))
+  done
+  if [ -s "$deadline_marker" ]; then
+    deadline_status=$(sed -n '1p' "$deadline_marker")
+    wait "$deadline_command_pid" 2>/dev/null || true
+  else
+    kill -TERM "$deadline_command_pid" 2>/dev/null || true
+    wait "$deadline_command_pid" 2>/dev/null || true
+    deadline_status=124
+  fi
+  deadline_command_pid=
+  unlink "$deadline_marker"
+  deadline_marker=
+  return "$deadline_status"
+}
+
+compose_with_deadline() {
+  deadline_seconds=$1
+  shift
+  run_with_deadline "$deadline_seconds" env \
+    LOCAL_STACK_CHECKOUT_ID="$checkout_id" \
+    LOCAL_STACK_CONFIG_IDENTITY="$identity" \
+    LOCAL_STACK_STATE_GENERATION="$generation" \
+    docker compose --project-name "$compose_project" --file "$REPO_ROOT/deploy/local/compose.yaml" "$@"
+}
+
+remaining_budget() {
+  budget_started=$1
+  budget_total=$2
+  budget_cap=$3
+  budget_elapsed=$(($(date +%s) - budget_started))
+  budget_remaining=$((budget_total - budget_elapsed))
+  [ "$budget_remaining" -gt 0 ] || return 1
+  if [ "$budget_remaining" -lt "$budget_cap" ]; then
+    printf '%s\n' "$budget_remaining"
+  else
+    printf '%s\n' "$budget_cap"
+  fi
+}
+
+bounded_budget() {
+  stage_started=$1
+  stage_total=$2
+  aggregate_started=$3
+  aggregate_total=$4
+  per_call_cap=$5
+  stage_budget=$(remaining_budget "$stage_started" "$stage_total" "$per_call_cap") || return 1
+  aggregate_budget=$(remaining_budget "$aggregate_started" "$aggregate_total" "$per_call_cap") || return 1
+  if [ "$stage_budget" -lt "$aggregate_budget" ]; then
+    printf '%s\n' "$stage_budget"
+  else
+    printf '%s\n' "$aggregate_budget"
+  fi
+}
+
+install_lifecycle_traps() {
+  trap cleanup_on_exit EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+}
+
+clear_lifecycle_traps() {
+  trap - EXIT HUP INT TERM
+}
+
+assert_value() {
+  value=$1
+  pattern=$2
+  label=$3
+  printf '%s\n' "$value" | grep -Eq "$pattern" || fail "generated $label failed validation"
+}
+
+config_identity() {
+  {
+    for file in \
+      "$REPO_ROOT/deploy/local/.env.example" \
+      "$REPO_ROOT/deploy/local/compose.yaml" \
+      "$REPO_ROOT/config/upstream/kratos/local/kratos.yaml" \
+      "$REPO_ROOT/tests/integration/local_stack/fixtures/kratos/local-smoke.identity.schema.json" \
+      "$REPO_ROOT/tests/integration/local_stack/fixtures/kratos/identity.json" \
+      "$REPO_ROOT/tests/integration/local_stack/fixtures/spicedb/schema.zed" \
+      "$REPO_ROOT/tests/integration/local_stack/fixtures/spicedb/schema.json" \
+      "$REPO_ROOT/tests/integration/local_stack/fixtures/spicedb/relationship.json" \
+      "$REPO_ROOT/tests/integration/local_stack/fixtures/spicedb/check-allow.json" \
+      "$REPO_ROOT/tests/integration/local_stack/fixtures/spicedb/check-deny.json" \
+      "$REPO_ROOT/tests/integration/local_stack/smoke.sh"; do
+      [ -f "$file" ] || fail "configuration input is missing: ${file#"$REPO_ROOT/"}"
+      printf '%s %s\n' "${file#"$REPO_ROOT/"}" "$(git hash-object "$file")"
+    done
+  } | git hash-object --stdin
+}
+
+fixture_identity() {
+  {
+    for file in \
+      "$REPO_ROOT/tests/integration/local_stack/fixtures/kratos/local-smoke.identity.schema.json" \
+      "$REPO_ROOT/tests/integration/local_stack/fixtures/kratos/identity.json" \
+      "$REPO_ROOT/tests/integration/local_stack/fixtures/spicedb/schema.zed" \
+      "$REPO_ROOT/tests/integration/local_stack/fixtures/spicedb/schema.json" \
+      "$REPO_ROOT/tests/integration/local_stack/fixtures/spicedb/relationship.json" \
+      "$REPO_ROOT/tests/integration/local_stack/fixtures/spicedb/check-allow.json" \
+      "$REPO_ROOT/tests/integration/local_stack/fixtures/spicedb/check-deny.json" \
+      "$REPO_ROOT/tests/integration/local_stack/smoke.sh"; do
+      printf '%s %s\n' "${file#"$REPO_ROOT/"}" "$(git hash-object "$file")"
+    done
+  } | git hash-object --stdin
+}
+
+file_mode() {
+  if stat -f '%Lp' "$1" >/dev/null 2>&1; then
+    stat -f '%Lp' "$1"
+  else
+    stat -c '%a' "$1"
+  fi
+}
+
+file_owner() {
+  if stat -f '%u' "$1" >/dev/null 2>&1; then
+    stat -f '%u' "$1"
+  else
+    stat -c '%u' "$1"
+  fi
+}
+
+read_credential() {
+  key=$1
+  awk -F= -v key="$key" '
+    $1 == key { count += 1; value = substr($0, length(key) + 2) }
+    END { if (count != 1) exit 1; print value }
+  ' "$credentials"
+}
+
+validate_local_path() {
+  file=$1
+  [ -f "$file" ] && [ ! -L "$file" ] || fail "required local file is missing or unsafe: ${file#"$REPO_ROOT/"}"
+  [ "$(file_mode "$file")" = 600 ] || fail "local file must have mode 600: ${file#"$REPO_ROOT/"}"
+  [ "$(file_owner "$file")" = "$(id -u)" ] || fail "local file has the wrong owner: ${file#"$REPO_ROOT/"}"
+}
+
+validate_credentials() {
+  validate_local_path "$credentials"
+
+  awk -F= '
+    !/^(SECRETS_CIPHER|SECRETS_COOKIE|SECRETS_PAGINATION|SPICEDB_GRPC_PRESHARED_KEY)=/ { exit 1 }
+    END { if (NR != 4) exit 1 }
+  ' "$credentials" || fail 'credential file has unexpected or missing entries'
+
+  cipher=$(read_credential SECRETS_CIPHER) || fail 'Kratos cipher secret is missing or duplicated'
+  cookie=$(read_credential SECRETS_COOKIE) || fail 'Kratos cookie secret is missing or duplicated'
+  pagination=$(read_credential SECRETS_PAGINATION) || fail 'Kratos pagination secret is missing or duplicated'
+  spicedb=$(read_credential SPICEDB_GRPC_PRESHARED_KEY) || fail 'SpiceDB preshared key is missing or duplicated'
+  assert_value "$cipher" '^[A-Za-z0-9_-]{32}$' 'Kratos cipher secret'
+  assert_value "$cookie" '^[A-Za-z0-9_-]{43}$' 'Kratos cookie secret'
+  assert_value "$pagination" '^[A-Za-z0-9_-]{43}$' 'Kratos pagination secret'
+  assert_value "$spicedb" '^[A-Za-z0-9_-]{43}$' 'SpiceDB preshared key'
+  [ "$cipher" != "$cookie" ] && [ "$cipher" != "$pagination" ] && [ "$cipher" != "$spicedb" ] &&
+    [ "$cookie" != "$pagination" ] && [ "$cookie" != "$spicedb" ] && [ "$pagination" != "$spicedb" ] ||
+    fail 'local credential values are not distinct'
+}
+
+validate_local_files() {
+  credentials="$REPO_ROOT/deploy/local/.local-stack-credentials.env"
+  state="$REPO_ROOT/deploy/local/.local-stack-state.json"
+  validate_credentials
+  validate_local_path "$state"
+}
+
+load_state() {
+  validate_local_files
+  canonical_checkout=$(CDPATH='' cd -- "$REPO_ROOT" && pwd -P)
+  identity=$(config_identity)
+  jq -e \
+    --arg canonical_checkout "$canonical_checkout" \
+    --arg config_identity "$identity" '
+      .schema_version == 1 and
+      .canonical_checkout == $canonical_checkout and
+      .config_identity == $config_identity and
+      (.checkout_id | test("^[0-9a-f]{12}$")) and
+      (.state_generation | test("^[A-Za-z0-9_-]{43}$")) and
+      (.compose_project | test("^identity-stack-local-[0-9a-f]{12}$")) and
+      (.phase == "initialized" or .phase == "ready" or .phase == "stopped" or .phase == "startup-failed") and
+      (.resources | type == "object") and
+      (.resources.containers | type == "array" and all(.[]; (.id | test("^[A-Za-z0-9][A-Za-z0-9_.-]*$")) and (.name | test("^[A-Za-z0-9][A-Za-z0-9_.-]*$")) and (.service | test("^[a-z0-9][a-z0-9-]*$")))) and
+      (.resources.networks | type == "array" and all(.[]; .name | test("^[A-Za-z0-9][A-Za-z0-9_.-]*$"))) and
+      (.resources.volumes | type == "array" and all(.[]; .name | test("^[A-Za-z0-9][A-Za-z0-9_.-]*$")))
+    ' "$state" >/dev/null || fail 'state journal does not match this checkout and configuration'
+  checkout_id=$(jq -er '.checkout_id' "$state")
+  generation=$(jq -er '.state_generation' "$state")
+  compose_project=$(jq -er '.compose_project' "$state")
+}
+
+load_reset_state() {
+  credentials="$REPO_ROOT/deploy/local/.local-stack-credentials.env"
+  state="$REPO_ROOT/deploy/local/.local-stack-state.json"
+  validate_local_path "$state"
+  canonical_checkout=$(CDPATH='' cd -- "$REPO_ROOT" && pwd -P)
+  jq -e \
+    --arg canonical_checkout "$canonical_checkout" '
+      .schema_version == 1 and
+      .canonical_checkout == $canonical_checkout and
+      (.config_identity | test("^[0-9a-f]{40}$")) and
+      (.checkout_id | test("^[0-9a-f]{12}$")) and
+      (.state_generation | test("^[A-Za-z0-9_-]{43}$")) and
+      (.compose_project | test("^identity-stack-local-[0-9a-f]{12}$")) and
+      (.phase == "initialized" or .phase == "ready" or .phase == "stopped" or .phase == "startup-failed" or .phase == "resetting") and
+      (.resources | type == "object") and
+      (.resources.containers | type == "array" and all(.[]; (.id | test("^[A-Za-z0-9][A-Za-z0-9_.-]*$")) and (.name | test("^[A-Za-z0-9][A-Za-z0-9_.-]*$")) and (.service | test("^[a-z0-9][a-z0-9-]*$")))) and
+      (.resources.networks | type == "array" and all(.[]; .name | test("^[A-Za-z0-9][A-Za-z0-9_.-]*$"))) and
+      (.resources.volumes | type == "array" and all(.[]; .name | test("^[A-Za-z0-9][A-Za-z0-9_.-]*$")))
+    ' "$state" >/dev/null || fail 'state journal is unsafe for reset or belongs to another checkout'
+  checkout_id=$(jq -er '.checkout_id' "$state")
+  identity=$(jq -er '.config_identity' "$state")
+  generation=$(jq -er '.state_generation' "$state")
+  compose_project=$(jq -er '.compose_project' "$state")
+  reset_phase=$(jq -er '.phase' "$state")
+  if [ -e "$credentials" ] || [ -L "$credentials" ]; then
+    validate_credentials
+    credentials_present=1
+  else
+    credentials_present=0
+    jq -e '
+      .phase == "resetting" and
+      (.resources.containers | length) == 0 and
+      (.resources.networks | length) == 0 and
+      (.resources.volumes | length) == 0
+    ' "$state" >/dev/null || fail 'credentials are absent before reset reached its empty finalization state'
+  fi
+}
+
+compose_cmd() {
+  LOCAL_STACK_CHECKOUT_ID="$checkout_id" \
+  LOCAL_STACK_CONFIG_IDENTITY="$identity" \
+  LOCAL_STACK_STATE_GENERATION="$generation" \
+    docker compose --project-name "$compose_project" --file "$REPO_ROOT/deploy/local/compose.yaml" "$@"
+}
+
+replace_state() {
+  replacement=$1
+  state_tmp=$(mktemp "$REPO_ROOT/deploy/local/.local-stack-state.tmp.XXXXXX")
+  chmod 600 "$state_tmp"
+  printf '%s\n' "$replacement" >"$state_tmp"
+  mv -f "$state_tmp" "$state"
+  state_tmp=
+}
+
+normalize_compose_ps() {
+  jq -s 'if length == 1 and (.[0] | type) == "array" then .[0] else . end'
+}
+
+aggregate_ready() {
+  jq -e '
+    length == 4 and
+    (map(select(.Service == "kratos-migrate" and .State == "exited" and .ExitCode == 0)) | length) == 1 and
+    (map(select(.Service == "kratos" and .State == "running" and .Health == "healthy")) | length) == 1 and
+    (map(select(.Service == "spicedb" and .State == "running")) | length) == 1 and
+    (map(select(.Service == "local-stack-bootstrap" and .State == "exited" and .ExitCode == 0)) | length) == 1
+  ' >/dev/null
+}
+
+discover_resources() {
+  discovered_ps_raw=$(compose_with_deadline "$CHECK_TIMEOUT" ps --all --format json) || return 1
+  discovered_ps=$(printf '%s\n' "$discovered_ps_raw" | normalize_compose_ps) || return 1
+  discovered_networks=$(run_with_deadline "$CHECK_TIMEOUT" docker network ls \
+    --filter "label=com.docker.compose.project=$compose_project" --format '{{.Name}}') || return 1
+  discovered_volumes=$(run_with_deadline "$CHECK_TIMEOUT" docker volume ls \
+    --filter "label=com.docker.compose.project=$compose_project" --format '{{.Name}}') || return 1
+  jq -n \
+    --argjson containers "$(printf '%s\n' "$discovered_ps" | jq '[.[] | {id: .ID, name: .Name, service: .Service}]')" \
+    --argjson networks "$(printf '%s' "$discovered_networks" | jq -Rsc 'split("\n") | map(select(length > 0) | {name: .})')" \
+    --argjson volumes "$(printf '%s' "$discovered_volumes" | jq -Rsc 'split("\n") | map(select(length > 0) | {name: .})')" \
+    '{containers: $containers, networks: $networks, volumes: $volumes}'
+}
+
+record_startup_failure() {
+  resources=$(discover_resources) || fail 'startup failed and resource discovery could not be journaled'
+  updated=$(jq --argjson resources "$resources" '
+    .phase = "startup-failed" |
+    .resources = $resources |
+    .migration = {completed: false} |
+    .bootstrap = {completed: false}
+  ' "$state") || fail 'startup failed and state recovery could not be journaled'
+  replace_state "$updated"
+}
+
+wait_for_bootstrap() {
+  bootstrap_started=$1
+  aggregate_started=$2
+  aggregate_total=${3:-$AGGREGATE_UP_TIMEOUT}
+  while :; do
+    poll_budget=$(bounded_budget "$bootstrap_started" "$BOOTSTRAP_TIMEOUT" \
+      "$aggregate_started" "$aggregate_total" "$CHECK_TIMEOUT") || return 1
+    ps_raw=$(compose_with_deadline "$poll_budget" ps --all --format json) || return 1
+    ps_json=$(printf '%s\n' "$ps_raw" | normalize_compose_ps) || return 1
+    bootstrap_record=$(printf '%s\n' "$ps_json" | jq -r '
+      [.[] | select(.Service == "local-stack-bootstrap")] |
+      if length == 1 then "1|\(.[0].State)|\(.[0].ExitCode)" else "\(length)" end
+    ') || return 1
+    bootstrap_count=${bootstrap_record%%|*}
+    if [ "$bootstrap_count" -eq 1 ]; then
+      bootstrap_details=${bootstrap_record#*|}
+      bootstrap_state=${bootstrap_details%%|*}
+      bootstrap_exit=${bootstrap_details#*|}
+      if [ "$bootstrap_state" = exited ]; then
+        [ "$bootstrap_exit" -eq 0 ]
+        return
+      fi
+    fi
+    bounded_budget "$bootstrap_started" "$BOOTSTRAP_TIMEOUT" \
+      "$aggregate_started" "$aggregate_total" 1 >/dev/null || return 1
+    sleep 1
+  done
+}
+
+bring_up() {
+  reject_ambient_overrides
+  for command_name in git docker jq openssl awk sed grep tr mktemp chmod mv stat id date ln unlink mkdir rmdir find wc sleep ps env; do
+    need_command "$command_name"
+  done
+  PROCESS_START_FINGERPRINT=$(process_start_fingerprint $$) || fail 'cannot attest the current process start identity'
+  attest_local_docker
+  load_state
+  acquire_lock
+  install_lifecycle_traps
+  up_started=$(date +%s)
+
+  stage_started=$(date +%s)
+  stage_budget=$(bounded_budget "$stage_started" "$CHECK_TIMEOUT" "$up_started" "$AGGREGATE_UP_TIMEOUT" "$CHECK_TIMEOUT") ||
+    fail 'aggregate up timed out during Compose model validation'
+  compose_with_deadline "$stage_budget" config --no-env-resolution --quiet || fail 'Compose model validation failed or timed out'
+  stage_started=$(date +%s)
+  stage_budget=$(bounded_budget "$stage_started" "$IMAGE_PULL_TIMEOUT" "$up_started" "$AGGREGATE_UP_TIMEOUT" "$IMAGE_PULL_TIMEOUT") ||
+    fail 'aggregate up timed out before pinned image acquisition'
+  compose_with_deadline "$stage_budget" pull --quiet || fail 'pinned image acquisition failed or timed out'
+  stage_started=$(date +%s)
+  stage_budget=$(bounded_budget "$stage_started" "$MIGRATION_TIMEOUT" "$up_started" "$AGGREGATE_UP_TIMEOUT" "$MIGRATION_TIMEOUT") ||
+    fail 'aggregate up timed out before Kratos migration'
+  if ! compose_with_deadline "$stage_budget" up --detach kratos; then
+    record_startup_failure
+    fail 'Kratos migration or startup failed or timed out; exact discovered resources were preserved for reset or retry'
+  fi
+  stage_started=$(date +%s)
+  stage_budget=$(bounded_budget "$stage_started" "$CHECK_TIMEOUT" "$up_started" "$AGGREGATE_UP_TIMEOUT" "$CHECK_TIMEOUT") || {
+    record_startup_failure
+    fail 'aggregate up timed out before SpiceDB recreation; exact discovered resources were preserved for reset or retry'
+  }
+  if ! compose_with_deadline "$stage_budget" up --detach --no-deps --force-recreate spicedb; then
+    record_startup_failure
+    fail 'SpiceDB recreation failed or timed out; exact discovered resources were preserved for reset or retry'
+  fi
+  stage_started=$(date +%s)
+  if ! wait_for_kratos "$stage_started" "$up_started"; then
+    record_startup_failure
+    if ! remaining_budget "$up_started" "$AGGREGATE_UP_TIMEOUT" 1 >/dev/null; then
+      fail 'aggregate up timed out during Kratos readiness; exact discovered resources were preserved for reset or retry'
+    fi
+    fail 'Kratos readiness timed out; exact discovered resources were preserved for reset or retry'
+  fi
+  stage_started=$(date +%s)
+  if ! wait_for_spicedb "$stage_started" "$up_started"; then
+    record_startup_failure
+    if ! remaining_budget "$up_started" "$AGGREGATE_UP_TIMEOUT" 1 >/dev/null; then
+      fail 'aggregate up timed out during SpiceDB health; exact discovered resources were preserved for reset or retry'
+    fi
+    fail 'SpiceDB health timed out; exact discovered resources were preserved for reset or retry'
+  fi
+  stage_started=$(date +%s)
+  stage_budget=$(bounded_budget "$stage_started" "$CHECK_TIMEOUT" "$up_started" "$AGGREGATE_UP_TIMEOUT" "$CHECK_TIMEOUT") || {
+    record_startup_failure
+    fail 'aggregate up timed out before SpiceDB fixture bootstrap; exact discovered resources were preserved for reset or retry'
+  }
+  if ! compose_with_deadline "$stage_budget" up --detach --no-deps --force-recreate local-stack-bootstrap; then
+    record_startup_failure
+    fail 'SpiceDB fixture bootstrap start failed or timed out; exact discovered resources were preserved for reset or retry'
+  fi
+  stage_started=$(date +%s)
+  if ! wait_for_bootstrap "$stage_started" "$up_started"; then
+    record_startup_failure
+    if ! remaining_budget "$up_started" "$AGGREGATE_UP_TIMEOUT" 1 >/dev/null; then
+      fail 'aggregate up timed out during SpiceDB fixture bootstrap; exact discovered resources were preserved for reset or retry'
+    fi
+    fail 'component readiness or fixture bootstrap failed; exact discovered resources were preserved for reset or retry'
+  fi
+  if ! printf '%s\n' "$ps_json" | aggregate_ready; then
+    record_startup_failure
+    fail 'aggregate readiness did not satisfy every component gate; exact discovered resources were preserved for reset or retry'
+  fi
+
+  fixtures=$(fixture_identity)
+  updated=$(jq \
+    --argjson containers "$(printf '%s\n' "$ps_json" | jq '[.[] | {id: .ID, name: .Name, service: .Service}]')" \
+    --arg network "${compose_project}_local-internal" \
+    --arg volume "${compose_project}_kratos-sqlite" \
+    --arg config_identity "$identity" \
+    --arg state_generation "$generation" \
+    --arg fixture_identity "$fixtures" '
+      .phase = "ready" |
+      .resources.containers = $containers |
+      .resources.networks = [{name: $network}] |
+      .resources.volumes = [{name: $volume}] |
+      .migration = {
+        completed: true,
+        config_identity: $config_identity,
+        state_generation: $state_generation
+      } |
+      .bootstrap = {
+        completed: true,
+        fixture_identity: $fixture_identity,
+        state_generation: $state_generation
+      }
+    ' "$state") || fail 'could not update the state journal after readiness'
+  replace_state "$updated"
+  release_lock
+  clear_lifecycle_traps
+  printf '%s\n' 'Local stack ready.'
+}
+
+inspect_status() {
+  reject_ambient_overrides
+  for command_name in git docker jq openssl awk sed grep tr mktemp chmod stat id date ln unlink mkdir rmdir find wc ps env sleep; do
+    need_command "$command_name"
+  done
+  PROCESS_START_FINGERPRINT=$(process_start_fingerprint $$) || fail 'cannot attest the current process start identity'
+  attest_local_docker
+  load_state
+  acquire_lock
+  install_lifecycle_traps
+
+  ps_raw=$(compose_with_deadline "$CHECK_TIMEOUT" ps --all --format json) || fail 'component status inspection failed or timed out'
+  ps_json=$(printf '%s\n' "$ps_raw" | normalize_compose_ps) || fail 'component status output was malformed'
+  status_values=$(printf '%s\n' "$ps_json" | jq -r '
+    (if any(.[]; .Service == "kratos" and .State == "running" and .Health == "healthy") then "healthy" else "unready" end) + "|" +
+    (if any(.[]; .Service == "spicedb" and .State == "running") then "running" else "unready" end) + "|" +
+    (if any(.[]; .Service == "local-stack-bootstrap" and .State == "exited" and .ExitCode == 0) then "complete" else "incomplete" end)
+  ') || fail 'component status output was malformed'
+  kratos_status=${status_values%%|*}
+  remaining_statuses=${status_values#*|}
+  spicedb_status=${remaining_statuses%%|*}
+  bootstrap_status=${remaining_statuses#*|}
+
+  printf 'kratos: %s\n' "$kratos_status"
+  printf 'spicedb: %s\n' "$spicedb_status"
+  printf 'bootstrap: %s\n' "$bootstrap_status"
+  if printf '%s\n' "$ps_json" | aggregate_ready; then
+    printf '%s\n' 'aggregate: ready'
+    release_lock
+    clear_lifecycle_traps
+    return 0
+  fi
+  printf '%s\n' 'aggregate: unready'
+  fail 'one or more local components are unready'
+}
+
+assert_current_ready() {
+  fixtures=$(fixture_identity)
+  jq -e \
+    --arg config_identity "$identity" \
+    --arg state_generation "$generation" \
+    --arg fixture_identity "$fixtures" '
+      .phase == "ready" and
+      .migration.completed == true and
+      .migration.config_identity == $config_identity and
+      .migration.state_generation == $state_generation and
+      .bootstrap.completed == true and
+      .bootstrap.fixture_identity == $fixture_identity and
+      .bootstrap.state_generation == $state_generation
+    ' "$state" >/dev/null || fail 'smoke requires current migration and bootstrap attestations'
+
+  ps_raw=$(compose_with_deadline "$CHECK_TIMEOUT" ps --all --format json) || fail 'smoke component inspection failed or timed out'
+  ps_json=$(printf '%s\n' "$ps_raw" | normalize_compose_ps) || fail 'smoke component status output was malformed'
+  printf '%s\n' "$ps_json" | aggregate_ready || fail 'smoke requires every local component to be ready'
+
+  journal_ids=$(jq -r '.resources.containers[].id' "$state" | sort)
+  current_ids=$(printf '%s\n' "$ps_json" | jq -r '.[].ID' | sort)
+  [ "$journal_ids" = "$current_ids" ] || fail 'smoke refused stale component-process provenance'
+}
+
+scan_probe_output() {
+  output_file=$1
+  if grep -Fq -e "$cipher" -e "$cookie" -e "$pagination" -e "$spicedb" "$output_file"; then
+    fail 'smoke diagnostics exposed a generated credential'
+  fi
+  if grep -Eq 'Authorization:|ory_kratos_session=|"token"[[:space:]]*:' "$output_file"; then
+    fail 'smoke diagnostics exposed credential, cookie, or token material'
+  fi
+}
+
+run_smoke_probe() {
+  probe_phase=$1
+  probe_deadline=${2:-$SMOKE_TIMEOUT}
+  probe_output=$(mktemp "${TMPDIR:-/tmp}/identity-stack-smoke-output.XXXXXX")
+  if ! compose_with_deadline "$probe_deadline" run --rm --no-deps --pull never --entrypoint /bin/sh \
+    local-stack-bootstrap /smoke/smoke.sh "$probe_phase" >"$probe_output" 2>&1; then
+    scan_probe_output "$probe_output"
+    sed -n '1,20p' "$probe_output" >&2
+    unlink "$probe_output"
+    probe_output=
+    fail "functional smoke probe failed during $probe_phase"
+  fi
+  scan_probe_output "$probe_output"
+  result_count=$(grep -Fxc 'local component-fixture compatibility: pass' "$probe_output" || true)
+  [ "$result_count" -eq 1 ] || {
+    unlink "$probe_output"
+    probe_output=
+    fail 'functional smoke probe returned an ambiguous result label'
+  }
+  unlink "$probe_output"
+  probe_output=
+}
+
+capture_expected_probe_failure() {
+  probe_phase=$1
+  expected_stage=$2
+  probe_deadline=${3:-$SMOKE_TIMEOUT}
+  probe_output=$(mktemp "${TMPDIR:-/tmp}/identity-stack-smoke-output.XXXXXX")
+  if compose_with_deadline "$probe_deadline" run --rm --no-deps --pull never --entrypoint /bin/sh \
+    local-stack-bootstrap /smoke/smoke.sh "$probe_phase" >"$probe_output" 2>&1; then
+    expected_probe_failure_reason='probe unexpectedly passed while its component was stopped'
+  elif ! grep -Fq "$expected_stage" "$probe_output"; then
+    expected_probe_failure_reason='probe failed at a different gate than the stopped component'
+  else
+    expected_probe_failure_reason=
+  fi
+  scan_probe_output "$probe_output"
+  unlink "$probe_output"
+  probe_output=
+}
+
+probe_spicedb_ready() {
+  probe_deadline=$1
+  probe_output=$(mktemp "${TMPDIR:-/tmp}/identity-stack-spicedb-ready.XXXXXX")
+  probe_status=0
+  compose_with_deadline "$probe_deadline" run --rm --no-deps --pull never --entrypoint /bin/sh \
+    local-stack-bootstrap /smoke/smoke.sh spicedb-ready >"$probe_output" 2>&1 || probe_status=$?
+  scan_probe_output "$probe_output"
+  if [ "$probe_status" -ne 0 ] ||
+    [ "$(grep -Fxc 'local component-fixture compatibility: pass' "$probe_output" || true)" -ne 1 ]; then
+    unlink "$probe_output"
+    probe_output=
+    return 1
+  fi
+  unlink "$probe_output"
+  probe_output=
+}
+
+wait_for_spicedb() {
+  health_started=$1
+  aggregate_started=$2
+  aggregate_total=${3:-$AGGREGATE_UP_TIMEOUT}
+  while :; do
+    poll_budget=$(bounded_budget "$health_started" "$SPICEDB_HEALTH_TIMEOUT" \
+      "$aggregate_started" "$aggregate_total" "$CHECK_TIMEOUT") || return 1
+    if probe_spicedb_ready "$poll_budget"; then
+      return 0
+    fi
+    bounded_budget "$health_started" "$SPICEDB_HEALTH_TIMEOUT" \
+      "$aggregate_started" "$aggregate_total" 1 >/dev/null || return 1
+    sleep 1
+  done
+}
+
+wait_for_kratos() {
+  readiness_started=${1:-$(date +%s)}
+  aggregate_started=${2:-$readiness_started}
+  aggregate_total=${3:-$AGGREGATE_UP_TIMEOUT}
+  while :; do
+    poll_budget=$(bounded_budget "$readiness_started" "$KRATOS_READINESS_TIMEOUT" \
+      "$aggregate_started" "$aggregate_total" "$CHECK_TIMEOUT") || return 1
+    ps_raw=$(compose_with_deadline "$poll_budget" ps --all --format json) || return 1
+    ps_json=$(printf '%s\n' "$ps_raw" | normalize_compose_ps) || return 1
+    if printf '%s\n' "$ps_json" | jq -e '
+      (map(select(.Service == "kratos" and .State == "running" and .Health == "healthy")) | length) == 1
+    ' >/dev/null; then
+      return 0
+    fi
+    bounded_budget "$readiness_started" "$KRATOS_READINESS_TIMEOUT" \
+      "$aggregate_started" "$aggregate_total" 1 >/dev/null || return 1
+    sleep 1
+  done
+}
+
+mark_smoke_recovery_incomplete() {
+  updated=$(jq '
+    .phase = "startup-failed" |
+    .bootstrap = {completed: false}
+  ' "$state") || fail 'could not journal incomplete smoke recovery'
+  replace_state "$updated"
+}
+
+record_smoke_ready() {
+  fixtures=$(fixture_identity)
+  updated=$(jq \
+    --argjson containers "$(printf '%s\n' "$ps_json" | jq '[.[] | {id: .ID, name: .Name, service: .Service}]')" \
+    --arg fixture_identity "$fixtures" \
+    --arg state_generation "$generation" '
+      .phase = "ready" |
+      .resources.containers = $containers |
+      .bootstrap = {
+        completed: true,
+        fixture_identity: $fixture_identity,
+        state_generation: $state_generation
+      }
+    ' "$state") || fail 'could not update component provenance after smoke recovery'
+  replace_state "$updated"
+}
+
+run_smoke() {
+  reject_ambient_overrides
+  for command_name in git docker jq openssl awk sed grep tr sort mktemp chmod mv stat id date ln unlink mkdir rmdir find wc sleep ps env; do
+    need_command "$command_name"
+  done
+  PROCESS_START_FINGERPRINT=$(process_start_fingerprint $$) || fail 'cannot attest the current process start identity'
+  attest_local_docker
+  load_state
+  acquire_lock
+  install_lifecycle_traps
+  smoke_started=$(date +%s)
+
+  smoke_stage_budget=$(remaining_budget "$smoke_started" "$SMOKE_TIMEOUT" "$CHECK_TIMEOUT") || fail 'full component smoke timed out before model validation'
+  compose_with_deadline "$smoke_stage_budget" config --no-env-resolution --quiet || fail 'Compose model validation failed or timed out before smoke'
+  assert_current_ready
+  smoke_stage_budget=$(remaining_budget "$smoke_started" "$SMOKE_TIMEOUT" "$SMOKE_TIMEOUT") || fail 'full component smoke timed out before prepare'
+  run_smoke_probe prepare "$smoke_stage_budget"
+
+  smoke_stage_budget=$(remaining_budget "$smoke_started" "$SMOKE_TIMEOUT" "$DOWN_TIMEOUT") || fail 'full component smoke timed out before Kratos outage'
+  compose_with_deadline "$smoke_stage_budget" stop --timeout 60 kratos || fail 'Kratos outage setup failed or timed out'
+  smoke_stage_budget=$(remaining_budget "$smoke_started" "$SMOKE_TIMEOUT" "$SMOKE_TIMEOUT") || fail 'full component smoke timed out during Kratos outage evidence'
+  capture_expected_probe_failure verify 'Kratos identity-schema request failed' "$smoke_stage_budget"
+  smoke_stage_budget=$(remaining_budget "$smoke_started" "$SMOKE_TIMEOUT" "$CHECK_TIMEOUT") || fail 'full component smoke timed out before Kratos recovery'
+  compose_with_deadline "$smoke_stage_budget" up --detach --no-deps kratos || fail 'Kratos recovery start failed or timed out'
+  recovery_started=$(date +%s)
+  wait_for_kratos "$recovery_started" "$smoke_started" "$SMOKE_TIMEOUT" || fail 'Kratos recovery readiness timed out'
+  [ -z "$expected_probe_failure_reason" ] || fail "$expected_probe_failure_reason"
+  smoke_stage_budget=$(remaining_budget "$smoke_started" "$SMOKE_TIMEOUT" "$SMOKE_TIMEOUT") || fail 'full component smoke timed out before Kratos verification'
+  run_smoke_probe verify "$smoke_stage_budget"
+
+  smoke_stage_budget=$(remaining_budget "$smoke_started" "$SMOKE_TIMEOUT" "$SMOKE_TIMEOUT") || fail 'full component smoke timed out before SpiceDB reconciliation setup'
+  run_smoke_probe pollute "$smoke_stage_budget"
+  smoke_stage_budget=$(remaining_budget "$smoke_started" "$SMOKE_TIMEOUT" "$DOWN_TIMEOUT") || fail 'full component smoke timed out before SpiceDB outage'
+  compose_with_deadline "$smoke_stage_budget" stop --timeout 60 spicedb || fail 'SpiceDB outage setup failed or timed out'
+  smoke_stage_budget=$(remaining_budget "$smoke_started" "$SMOKE_TIMEOUT" "$SMOKE_TIMEOUT") || fail 'full component smoke timed out during SpiceDB outage evidence'
+  capture_expected_probe_failure verify 'SpiceDB schema reconciliation request failed' "$smoke_stage_budget"
+  mark_smoke_recovery_incomplete
+  smoke_stage_budget=$(remaining_budget "$smoke_started" "$SMOKE_TIMEOUT" "$CHECK_TIMEOUT") || fail 'full component smoke timed out before SpiceDB recovery'
+  if ! compose_with_deadline "$smoke_stage_budget" up --detach --no-deps --force-recreate spicedb; then
+    record_startup_failure
+    fail 'SpiceDB recovery start failed or timed out'
+  fi
+  smoke_stage_budget=$(remaining_budget "$smoke_started" "$SMOKE_TIMEOUT" "$CHECK_TIMEOUT") || fail 'full component smoke timed out before fixture reseed'
+  if ! compose_with_deadline "$smoke_stage_budget" up --detach --no-deps --force-recreate local-stack-bootstrap; then
+    record_startup_failure
+    fail 'SpiceDB fixture reseed start failed or timed out'
+  fi
+  bootstrap_started=$(date +%s)
+  if ! wait_for_bootstrap "$bootstrap_started" "$smoke_started" "$SMOKE_TIMEOUT"; then
+    record_startup_failure
+    fail 'SpiceDB fixture reseed timed out'
+  fi
+  [ -z "$expected_probe_failure_reason" ] || fail "$expected_probe_failure_reason"
+  printf '%s\n' "$ps_json" | aggregate_ready || fail 'aggregate readiness failed after SpiceDB fixture reseed'
+  record_smoke_ready
+  smoke_stage_budget=$(remaining_budget "$smoke_started" "$SMOKE_TIMEOUT" "$SMOKE_TIMEOUT") || fail 'full component smoke timed out before final verification'
+  run_smoke_probe verify "$smoke_stage_budget"
+
+  release_lock
+  clear_lifecycle_traps
+  printf '%s\n' 'local component-fixture compatibility: pass'
+}
+
+stop_stack() {
+  reject_ambient_overrides
+  for command_name in git docker jq openssl awk sed grep tr mktemp chmod mv stat id date ln unlink mkdir rmdir find wc sleep ps env; do
+    need_command "$command_name"
+  done
+  PROCESS_START_FINGERPRINT=$(process_start_fingerprint $$) || fail 'cannot attest the current process start identity'
+  attest_local_docker
+  load_state
+  acquire_lock
+  install_lifecycle_traps
+
+  compose_with_deadline "$DOWN_TIMEOUT" stop --timeout 60 || fail 'component stop failed or timed out'
+  updated=$(jq '.phase = "stopped"' "$state") || fail 'could not update the state journal after stop'
+  replace_state "$updated"
+  release_lock
+  clear_lifecycle_traps
+  printf '%s\n' 'Local stack stopped; state preserved.'
+}
+
+assert_exact_set() {
+  expected=$1
+  actual=$2
+  label=$3
+  expected_sorted=$(printf '%s\n' "$expected" | sed '/^$/d' | sort)
+  actual_sorted=$(printf '%s\n' "$actual" | sed '/^$/d' | sort)
+  [ "$expected_sorted" = "$actual_sorted" ] || fail "$label resource inventory does not match the journal; nothing was deleted"
+}
+
+assert_subset_set() {
+  expected=$1
+  actual=$2
+  label=$3
+  for actual_item in $actual; do
+    printf '%s\n' "$expected" | grep -Fxq "$actual_item" ||
+      fail "$label resource inventory contains an item outside the reset journal; nothing was deleted"
+  done
+}
+
+sync_reset_resources() {
+  live_container_ids=$1
+  live_network_names=$2
+  live_volume_names=$3
+  live_container_json=$(printf '%s\n' "$live_container_ids" | jq -Rsc 'split("\n") | map(select(length > 0))')
+  live_network_json=$(printf '%s\n' "$live_network_names" | jq -Rsc 'split("\n") | map(select(length > 0))')
+  live_volume_json=$(printf '%s\n' "$live_volume_names" | jq -Rsc 'split("\n") | map(select(length > 0))')
+  updated=$(jq \
+    --argjson container_ids "$live_container_json" \
+    --argjson network_names "$live_network_json" \
+    --argjson volume_names "$live_volume_json" '
+      .phase = "resetting" |
+      .resources.containers |= map(select(.id as $id | $container_ids | index($id))) |
+      .resources.networks |= map(select(.name as $name | $network_names | index($name))) |
+      .resources.volumes |= map(select(.name as $name | $volume_names | index($name)))
+    ' "$state") || fail 'could not journal exact remaining reset resources'
+  replace_state "$updated"
+}
+
+remove_reset_resource_from_journal() {
+  resource_type=$1
+  resource_key=$2
+  resource_value=$3
+  updated=$(jq --arg value "$resource_value" ".resources.$resource_type |= map(select(.$resource_key != \$value))" "$state") ||
+    fail 'could not checkpoint reset progress'
+  replace_state "$updated"
+}
+
+reset_stack() {
+  confirmed=$1
+  reject_ambient_overrides
+  for command_name in git jq openssl awk sed grep tr sort mktemp chmod mv stat id date ln unlink mkdir rmdir find wc sleep ps env; do
+    need_command "$command_name"
+  done
+  PROCESS_START_FINGERPRINT=$(process_start_fingerprint $$) || fail 'cannot attest the current process start identity'
+  load_reset_state
+  acquire_lock
+  install_lifecycle_traps
+
+  printf '%s\n' 'Reset would permanently remove:'
+  jq -r '.resources.containers[]? | "  container: \(.name)"' "$state"
+  jq -r '.resources.networks[]? | "  network: \(.name)"' "$state"
+  jq -r '.resources.volumes[]? | "  volume: \(.name)"' "$state"
+  if [ "$credentials_present" -eq 1 ]; then
+    printf '%s\n' '  file: deploy/local/.local-stack-credentials.env'
+  fi
+  printf '%s\n' '  file: deploy/local/.local-stack-state.json'
+
+  if [ "$confirmed" != yes ]; then
+    printf '%s\n' 'Re-run with reset --yes to confirm irreversible deletion.' >&2
+    release_lock
+    clear_lifecycle_traps
+    return 2
+  fi
+
+  need_command docker
+  attest_local_docker
+  reset_started=$(date +%s)
+  container_ids=$(jq -r '.resources.containers[]?.id' "$state")
+  network_names=$(jq -r '.resources.networks[]?.name' "$state")
+  volume_names=$(jq -r '.resources.volumes[]?.name' "$state")
+
+  reset_stage_budget=$(remaining_budget "$reset_started" "$RESET_TIMEOUT" "$CHECK_TIMEOUT") || fail 'confirmed reset timed out before container inventory'
+  actual_container_ids=$(run_with_deadline "$reset_stage_budget" docker container ls --all \
+    --filter "label=com.docker.compose.project=$compose_project" --format '{{.ID}}') ||
+    fail 'container inventory inspection failed; nothing was deleted'
+  reset_stage_budget=$(remaining_budget "$reset_started" "$RESET_TIMEOUT" "$CHECK_TIMEOUT") || fail 'confirmed reset timed out before network inventory'
+  actual_network_names=$(run_with_deadline "$reset_stage_budget" docker network ls \
+    --filter "label=com.docker.compose.project=$compose_project" --format '{{.Name}}') ||
+    fail 'network inventory inspection failed; nothing was deleted'
+  reset_stage_budget=$(remaining_budget "$reset_started" "$RESET_TIMEOUT" "$CHECK_TIMEOUT") || fail 'confirmed reset timed out before volume inventory'
+  actual_volume_names=$(run_with_deadline "$reset_stage_budget" docker volume ls \
+    --filter "label=com.docker.compose.project=$compose_project" --format '{{.Name}}') ||
+    fail 'volume inventory inspection failed; nothing was deleted'
+  if [ "$reset_phase" = resetting ]; then
+    assert_subset_set "$container_ids" "$actual_container_ids" 'container'
+    assert_subset_set "$network_names" "$actual_network_names" 'network'
+    assert_subset_set "$volume_names" "$actual_volume_names" 'volume'
+  else
+    assert_exact_set "$container_ids" "$actual_container_ids" 'container'
+    assert_exact_set "$network_names" "$actual_network_names" 'network'
+    assert_exact_set "$volume_names" "$actual_volume_names" 'volume'
+  fi
+  sync_reset_resources "$actual_container_ids" "$actual_network_names" "$actual_volume_names"
+  container_ids=$actual_container_ids
+  network_names=$actual_network_names
+  volume_names=$actual_volume_names
+
+  if [ -n "$container_ids" ]; then
+    # shellcheck disable=SC2086
+    reset_stage_budget=$(remaining_budget "$reset_started" "$RESET_TIMEOUT" "$CHECK_TIMEOUT") || fail 'confirmed reset timed out before container ownership inspection'
+    # shellcheck disable=SC2086
+    container_inventory=$(run_with_deadline "$reset_stage_budget" docker container inspect $container_ids) || fail 'container ownership inspection failed; nothing was deleted'
+    printf '%s\n' "$container_inventory" | jq -e \
+      --arg project "$compose_project" --arg checkout "$checkout_id" \
+      --arg config "$identity" --arg generation "$generation" '
+      all(.[];
+        .Config.Labels["com.docker.compose.project"] == $project and
+        .Config.Labels["dev.identity-stack.profile"] == "local" and
+        .Config.Labels["dev.identity-stack.checkout"] == $checkout and
+        .Config.Labels["dev.identity-stack.config"] == $config and
+        .Config.Labels["dev.identity-stack.generation"] == $generation
+      )
+    ' >/dev/null || fail 'container ownership labels do not match; nothing was deleted'
+  fi
+  if [ -n "$network_names" ]; then
+    # shellcheck disable=SC2086
+    reset_stage_budget=$(remaining_budget "$reset_started" "$RESET_TIMEOUT" "$CHECK_TIMEOUT") || fail 'confirmed reset timed out before network ownership inspection'
+    # shellcheck disable=SC2086
+    network_inventory=$(run_with_deadline "$reset_stage_budget" docker network inspect $network_names) || fail 'network ownership inspection failed; nothing was deleted'
+    printf '%s\n' "$network_inventory" | jq -e \
+      --arg project "$compose_project" --arg checkout "$checkout_id" \
+      --arg config "$identity" --arg generation "$generation" '
+      all(.[];
+        .Labels["com.docker.compose.project"] == $project and
+        .Labels["dev.identity-stack.profile"] == "local" and
+        .Labels["dev.identity-stack.checkout"] == $checkout and
+        .Labels["dev.identity-stack.config"] == $config and
+        .Labels["dev.identity-stack.generation"] == $generation
+      )
+    ' >/dev/null || fail 'network ownership labels do not match; nothing was deleted'
+  fi
+  if [ -n "$volume_names" ]; then
+    # shellcheck disable=SC2086
+    reset_stage_budget=$(remaining_budget "$reset_started" "$RESET_TIMEOUT" "$CHECK_TIMEOUT") || fail 'confirmed reset timed out before volume ownership inspection'
+    # shellcheck disable=SC2086
+    volume_inventory=$(run_with_deadline "$reset_stage_budget" docker volume inspect $volume_names) || fail 'volume ownership inspection failed; nothing was deleted'
+    printf '%s\n' "$volume_inventory" | jq -e \
+      --arg project "$compose_project" --arg checkout "$checkout_id" \
+      --arg config "$identity" --arg generation "$generation" '
+      all(.[];
+        .Labels["com.docker.compose.project"] == $project and
+        .Labels["dev.identity-stack.profile"] == "local" and
+        .Labels["dev.identity-stack.checkout"] == $checkout and
+        .Labels["dev.identity-stack.config"] == $config and
+        .Labels["dev.identity-stack.generation"] == $generation
+      )
+    ' >/dev/null || fail 'volume ownership labels do not match; nothing was deleted'
+  fi
+
+  for container_id in $container_ids; do
+    reset_stage_budget=$(remaining_budget "$reset_started" "$RESET_TIMEOUT" "$RESET_TIMEOUT") || fail 'confirmed reset timed out during container deletion'
+    run_with_deadline "$reset_stage_budget" docker container rm --force "$container_id" >/dev/null || fail 'exact container deletion failed; reset can be retried from its journal'
+    remove_reset_resource_from_journal containers id "$container_id"
+  done
+  for network_name in $network_names; do
+    reset_stage_budget=$(remaining_budget "$reset_started" "$RESET_TIMEOUT" "$RESET_TIMEOUT") || fail 'confirmed reset timed out during network deletion'
+    run_with_deadline "$reset_stage_budget" docker network rm "$network_name" >/dev/null || fail 'exact network deletion failed; reset can be retried from its journal'
+    remove_reset_resource_from_journal networks name "$network_name"
+  done
+  for volume_name in $volume_names; do
+    reset_stage_budget=$(remaining_budget "$reset_started" "$RESET_TIMEOUT" "$RESET_TIMEOUT") || fail 'confirmed reset timed out during volume deletion'
+    run_with_deadline "$reset_stage_budget" docker volume rm "$volume_name" >/dev/null || fail 'exact volume deletion failed; reset can be retried from its journal'
+    remove_reset_resource_from_journal volumes name "$volume_name"
+  done
+
+  reset_stage_budget=$(remaining_budget "$reset_started" "$RESET_TIMEOUT" "$CHECK_TIMEOUT") || fail 'confirmed reset timed out before final verification'
+  [ -z "$(run_with_deadline "$reset_stage_budget" docker container ls --all --filter "label=com.docker.compose.project=$compose_project" --format '{{.ID}}')" ] ||
+    fail 'containers remain after reset; local files were preserved'
+  reset_stage_budget=$(remaining_budget "$reset_started" "$RESET_TIMEOUT" "$CHECK_TIMEOUT") || fail 'confirmed reset timed out before final verification'
+  [ -z "$(run_with_deadline "$reset_stage_budget" docker network ls --filter "label=com.docker.compose.project=$compose_project" --format '{{.Name}}')" ] ||
+    fail 'network remains after reset; local files were preserved'
+  reset_stage_budget=$(remaining_budget "$reset_started" "$RESET_TIMEOUT" "$CHECK_TIMEOUT") || fail 'confirmed reset timed out before final verification'
+  [ -z "$(run_with_deadline "$reset_stage_budget" docker volume ls --filter "label=com.docker.compose.project=$compose_project" --format '{{.Name}}')" ] ||
+    fail 'volume remains after reset; local files were preserved'
+
+  if [ "$credentials_present" -eq 1 ]; then
+    [ -f "$credentials" ] && [ ! -L "$credentials" ] || fail 'credential path changed during reset'
+    unlink "$credentials"
+  else
+    [ ! -e "$credentials" ] && [ ! -L "$credentials" ] || fail 'credential path changed during reset finalization'
+  fi
+  [ -f "$state" ] && [ ! -L "$state" ] || fail 'state path changed during reset'
+  unlink "$state"
+  release_lock
+  clear_lifecycle_traps
+  printf '%s\n' 'Local stack reset complete.'
+}
+
+publish_exclusive() {
+  source_file=$1
+  target_file=$2
+  if ! ln "$source_file" "$target_file" 2>/dev/null; then
+    return 1
+  fi
+  unlink "$source_file"
+}
+
+release_lock() {
+  [ "${lock_owned:-0}" = 1 ] || return 0
+  [ -d "$lock_dir" ] && [ ! -L "$lock_dir" ] || return 0
+  [ -f "$lock_owner" ] && [ ! -L "$lock_owner" ] || return 0
+  recorded_token=$(jq -er '.ownership_token' "$lock_owner" 2>/dev/null) || return 0
+  [ "$recorded_token" = "$lock_token" ] || return 0
+  unlink "$lock_owner"
+  rmdir "$lock_dir"
+  lock_owned=0
+}
+
+cleanup_on_exit() {
+  if [ -n "${deadline_command_pid:-}" ]; then
+    kill -TERM "$deadline_command_pid" 2>/dev/null || true
+    wait "$deadline_command_pid" 2>/dev/null || true
+    deadline_command_pid=
+  fi
+  for file in "${credential_tmp:-}" "${state_tmp:-}" "${probe_output:-}"; do
+    if [ -n "$file" ] && [ -f "$file" ] && [ ! -L "$file" ]; then
+      unlink "$file"
+    fi
+  done
+  if [ -n "${deadline_marker:-}" ] && [ -f "$deadline_marker" ] && [ ! -L "$deadline_marker" ]; then
+    unlink "$deadline_marker"
+  fi
+  if [ "${credentials_published:-0}" = 1 ] && [ "${state_published:-0}" != 1 ] &&
+    [ -f "$credentials" ] && [ ! -L "$credentials" ]; then
+    unlink "$credentials"
+  fi
+  release_lock
+}
+
+acquire_lock() {
+  lock_dir="$REPO_ROOT/deploy/local/.local-stack.lock"
+  lock_owner="$lock_dir/owner.json"
+  lock_token=$(random_base64url 32)
+  lock_owned=0
+
+  if ! mkdir -m 700 "$lock_dir" 2>/dev/null; then
+    [ -d "$lock_dir" ] && [ ! -L "$lock_dir" ] || fail 'lifecycle lock path is unsafe'
+    entry_count=$(find "$lock_dir" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')
+    [ "$entry_count" = 1 ] && [ -f "$lock_owner" ] && [ ! -L "$lock_owner" ] ||
+      fail 'lifecycle lock is ambiguous; inspect it without deleting anything'
+    jq -e '
+      type == "object" and
+      (keys | sort) == ["acquired_at", "canonical_checkout", "config_identity", "ownership_token", "pid", "process_start_fingerprint", "state_generation"] and
+      (.canonical_checkout | type == "string" and length > 0) and
+      (.config_identity | test("^[0-9a-f]{40}$")) and
+      (.state_generation | test("^[A-Za-z0-9_-]{43}$")) and
+      (.pid | type == "number" and . > 0 and floor == .) and
+      (.process_start_fingerprint | type == "string" and length > 0) and
+      (.ownership_token | test("^[A-Za-z0-9_-]{43}$")) and
+      (.acquired_at | type == "string" and length > 0)
+    ' "$lock_owner" >/dev/null 2>&1 || fail 'lifecycle lock is corrupt; inspect it without deleting anything'
+
+    prior_pid=$(jq -er '.pid' "$lock_owner")
+    prior_checkout=$(jq -er '.canonical_checkout' "$lock_owner")
+    [ "$prior_checkout" = "$canonical_checkout" ] ||
+      fail 'lifecycle lock provenance does not match this checkout'
+    if kill -0 "$prior_pid" 2>/dev/null; then
+      prior_fingerprint=$(jq -er '.process_start_fingerprint' "$lock_owner")
+      current_fingerprint=$(process_start_fingerprint "$prior_pid") ||
+        fail "a live or ambiguous process owns the lifecycle lock (pid $prior_pid)"
+      if [ "$prior_fingerprint" = "$current_fingerprint" ]; then
+        fail "a live process owns the lifecycle lock (pid $prior_pid)"
+      fi
+    fi
+    unlink "$lock_owner"
+    rmdir "$lock_dir"
+    mkdir -m 700 "$lock_dir" || fail 'could not replace a provably stale lifecycle lock'
+  fi
+
+  owner_tmp=$(mktemp "$lock_dir/.owner.tmp.XXXXXX")
+  chmod 600 "$owner_tmp"
+  jq -n \
+    --arg canonical_checkout "$canonical_checkout" \
+    --arg config_identity "$identity" \
+    --arg state_generation "$generation" \
+    --arg process_start_fingerprint "$PROCESS_START_FINGERPRINT" \
+    --arg ownership_token "$lock_token" \
+    --arg acquired_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    --argjson pid "$$" \
+    '{
+      canonical_checkout: $canonical_checkout,
+      config_identity: $config_identity,
+      state_generation: $state_generation,
+      pid: $pid,
+      process_start_fingerprint: $process_start_fingerprint,
+      acquired_at: $acquired_at,
+      ownership_token: $ownership_token
+    }' >"$owner_tmp"
+  if ! ln "$owner_tmp" "$lock_owner" 2>/dev/null; then
+    unlink "$owner_tmp"
+    rmdir "$lock_dir" 2>/dev/null || true
+    fail 'could not publish the lifecycle lock owner'
+  fi
+  unlink "$owner_tmp"
+  lock_owned=1
+}
+
+initialize() {
+  reject_ambient_overrides
+  for command_name in git docker jq openssl awk sed grep tr mktemp chmod ln unlink mkdir rmdir find wc date stat id ps env sleep; do
+    need_command "$command_name"
+  done
+  PROCESS_START_FINGERPRINT=$(process_start_fingerprint $$) || fail 'cannot attest the current process start identity'
+  attest_local_docker
+
+  credentials="$REPO_ROOT/deploy/local/.local-stack-credentials.env"
+  state="$REPO_ROOT/deploy/local/.local-stack-state.json"
+  local_dir="$REPO_ROOT/deploy/local"
+
+  [ -d "$local_dir" ] && [ ! -L "$local_dir" ] || fail 'deploy/local must be an existing real directory'
+  for path in "$credentials" "$state"; do
+    if [ -e "$path" ] || [ -L "$path" ]; then
+      fail "refusing to overwrite or follow existing path: ${path#"$REPO_ROOT/"}"
+    fi
+  done
+
+  canonical_checkout=$(CDPATH='' cd -- "$REPO_ROOT" && pwd -P)
+  checkout_hash=$(printf '%s\n' "$canonical_checkout" | git hash-object --stdin)
+  checkout_id=$(printf '%.12s' "$checkout_hash")
+  identity=$(config_identity)
+  generation=$(random_base64url 32)
+  acquire_lock
+  install_lifecycle_traps
+
+  for path in "$credentials" "$state"; do
+    if [ -e "$path" ] || [ -L "$path" ]; then
+      fail "refusing to overwrite or follow existing path: ${path#"$REPO_ROOT/"}"
+    fi
+  done
+
+  cipher=$(random_base64url 24)
+  cookie=$(random_base64url 32)
+  pagination=$(random_base64url 32)
+  spicedb=$(random_base64url 32)
+
+  assert_value "$cipher" '^[A-Za-z0-9_-]{32}$' 'Kratos cipher secret'
+  assert_value "$cookie" '^[A-Za-z0-9_-]{43}$' 'Kratos cookie secret'
+  assert_value "$pagination" '^[A-Za-z0-9_-]{43}$' 'Kratos pagination secret'
+  assert_value "$spicedb" '^[A-Za-z0-9_-]{43}$' 'SpiceDB preshared key'
+  assert_value "$generation" '^[A-Za-z0-9_-]{43}$' 'state generation'
+
+  [ "$cipher" != "$cookie" ] && [ "$cipher" != "$pagination" ] && [ "$cipher" != "$spicedb" ] &&
+    [ "$cookie" != "$pagination" ] && [ "$cookie" != "$spicedb" ] && [ "$pagination" != "$spicedb" ] ||
+    fail 'generated credential values unexpectedly collided'
+
+  credential_tmp=$(mktemp "$local_dir/.local-stack-credentials.tmp.XXXXXX")
+  state_tmp=$(mktemp "$local_dir/.local-stack-state.tmp.XXXXXX")
+  chmod 600 "$credential_tmp" "$state_tmp"
+
+  {
+    printf 'SECRETS_CIPHER=%s\n' "$cipher"
+    printf 'SECRETS_COOKIE=%s\n' "$cookie"
+    printf 'SECRETS_PAGINATION=%s\n' "$pagination"
+    printf 'SPICEDB_GRPC_PRESHARED_KEY=%s\n' "$spicedb"
+  } >"$credential_tmp"
+
+  jq -n \
+    --arg canonical_checkout "$canonical_checkout" \
+    --arg checkout_id "$checkout_id" \
+    --arg config_identity "$identity" \
+    --arg state_generation "$generation" \
+    --arg compose_project "identity-stack-local-$checkout_id" \
+    '{
+      schema_version: 1,
+      canonical_checkout: $canonical_checkout,
+      checkout_id: $checkout_id,
+      config_identity: $config_identity,
+      state_generation: $state_generation,
+      compose_project: $compose_project,
+      phase: "initialized",
+      resources: {containers: [], networks: [], volumes: []}
+    }' >"$state_tmp"
+
+  if ! publish_exclusive "$credential_tmp" "$credentials"; then
+    fail 'refusing to overwrite or follow existing credential path'
+  fi
+  credential_tmp=
+  credentials_published=1
+  if ! publish_exclusive "$state_tmp" "$state"; then
+    fail 'refusing to overwrite or follow existing state-journal path'
+  fi
+  state_tmp=
+  state_published=1
+  release_lock
+  clear_lifecycle_traps
+
+  printf '%s\n' 'Local stack initialized.'
+}
+
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname "$0")" && pwd -P)
+REPO_ROOT=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null) || fail 'script is not inside a Git checkout'
+REPO_ROOT=$(CDPATH='' cd -- "$REPO_ROOT" && pwd -P)
+
+case "${1:-}" in
+  init)
+    [ "$#" -eq 1 ] || fail 'usage: bin/local-stack init' 64
+    initialize
+    ;;
+  up)
+    [ "$#" -eq 1 ] || fail 'usage: bin/local-stack up' 64
+    bring_up
+    ;;
+  status)
+    [ "$#" -eq 1 ] || fail 'usage: bin/local-stack status' 64
+    inspect_status
+    ;;
+  smoke)
+    [ "$#" -eq 1 ] || fail 'usage: bin/local-stack smoke' 64
+    run_smoke
+    ;;
+  down)
+    [ "$#" -eq 1 ] || fail 'usage: bin/local-stack down' 64
+    stop_stack
+    ;;
+  reset)
+    if [ "$#" -eq 1 ]; then
+      reset_stack no
+    elif [ "$#" -eq 2 ] && [ "$2" = --yes ]; then
+      reset_stack yes
+    else
+      fail 'usage: bin/local-stack reset [--yes]' 64
+    fi
+    ;;
+  *)
+    fail 'usage: bin/local-stack init|up|status|smoke|down|reset' 64
+    ;;
+esac

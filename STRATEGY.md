@@ -47,11 +47,15 @@ for these boundaries and their consequences.
 
 ## Current investment track
 
-Milestone 1 establishes repository-native contracts: strategy, architectural
-decisions, target ownership, dependency and testing policy, security review,
-and completion expectations. This track is documentation-only and deliberately
-does not create services, runtime configuration, deployment packaging, or
-executable tests.
+Milestone 2 establishes a pinned Docker Compose local/test fixture for Kratos
+and SpiceDB, with generated local credentials, guarded lifecycle operations,
+real component smoke checks, and narrowly scoped compatibility evidence. It is
+an integration target for later work, not a control plane, consuming
+application, production deployment, or regulatory-compliance profile.
+
+The approved [global realm data-residency Product Contract](docs/plans/2026-08-14-1804-feat-global-realm-data-residency-plan.md)
+sets the future stack-versus-consumer responsibility boundary. Its production
+topology and jurisdiction profiles are not implemented by the local fixture.
 
 ## Milestone direction
 
@@ -83,7 +87,7 @@ appropriate, an architecture decision must resolve them before implementation:
 - Public API contract style.
 - Initial administrative interface shape.
 - The boundary between shared and application-owned profile attributes.
-- Initial privacy jurisdictions and retention periods.
+- Exact production residency-jurisdiction profiles and retention periods.
 - Audit integrity, storage, and export design.
 - Production deployment packaging and the first GCP reference shape.
 - Aggregate and client-package release and versioning policy.

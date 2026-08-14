@@ -1,0 +1,20 @@
+{
+  "updates": [
+    {
+      "operation": "OPERATION_TOUCH",
+      "relationship": {
+        "resource": {
+          "objectType": "local_smoke_document",
+          "objectId": "fixture-document"
+        },
+        "relation": "viewer",
+        "subject": {
+          "object": {
+            "objectType": "local_smoke_user",
+            "objectId": "fixture-allowed"
+          }
+        }
+      }
+    }
+  ]
+}

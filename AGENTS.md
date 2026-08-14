@@ -1,9 +1,10 @@
 # Repository guidance
 
-Milestone 1 is documentation-only. The repository has no application runtime,
-build system, test harness, formatter, or linter yet. Do not invent commands for
-tools that are not present, and do not add implementation scaffolding merely to
-make a command available.
+The repository has a pinned Docker Compose local/test fixture and shell-based
+contract tests. It still has no control-plane or consuming-application runtime,
+Elixir build, or production deployment toolchain. Do not invent commands for
+tools that are not present or generalize the local fixture into those missing
+capabilities.
 
 ## Read the owning documents
 
@@ -18,8 +19,10 @@ make a command available.
 - Use the [threat-modeling process](docs/security/threat-modeling.md) for
   security-sensitive changes and [SECURITY.md](SECURITY.md) for private
   vulnerability reports.
-- Use the [current plan](docs/plans/2026-08-14-001-docs-repository-foundation-plan.md)
-  for this milestone and the
+- Use the [current plan](docs/plans/2026-08-14-0647-feat-pinned-local-development-environment-plan.md)
+  for the local fixture milestone, the
+  [local development runbook](docs/runbooks/local-development.md) for operator
+  behavior, and the
   [handoff authority map](docs/project/handoff-authority-map.md) for inherited
   decisions and deferrals.
 
@@ -44,22 +47,46 @@ make a command available.
 
 ## Current verification
 
-Run checks from the repository root. These documentation and inventory commands
-are available now:
+Run checks from the repository root. The supported local operator interface is:
+
+```sh
+bin/local-stack init
+bin/local-stack up
+bin/local-stack status
+bin/local-stack smoke
+bin/local-stack down
+bin/local-stack reset
+```
+
+`smoke` deliberately injects component outages; `reset --yes` irreversibly
+deletes the exact journal-owned local profile and paired credentials. Read the
+runbook before using either. Do not replace the wrapper with raw Compose or
+broad Docker cleanup commands.
+
+The current shell and repository checks are:
 
 ```sh
 git status --short --branch
 git ls-files --cached --others --exclude-standard | sort
 git diff --exit-code HEAD -- LICENSE
 ignore_match=$(git check-ignore -v --no-index docs/handoffs/identity-stack-handoff.md) && ignore_source=${ignore_match%%:*} && test "$ignore_source" = "$(git rev-parse --git-path info/exclude)" && { rg -n '^docs/handoffs/?$' .gitignore; test $? -eq 1; }
-rg -n '[[:blank:]]+$' .gitignore AGENTS.md README.md SECURITY.md STRATEGY.md docs/architecture docs/plans docs/policies docs/project docs/security; test $? -eq 1
+shellcheck bin/local-stack tests/integration/local_stack/*.sh
+tests/integration/local_stack/workflow_test.sh
+tests/integration/local_stack/init_test.sh
+tests/integration/local_stack/config_test.sh
+tests/integration/local_stack/deadline_signal_test.sh
+tests/integration/local_stack/startup_deadline_test.sh
+tests/integration/local_stack/bootstrap_test.sh
+tests/integration/local_stack/lifecycle_test.sh
+tests/integration/local_stack/startup_failure_test.sh
+rg -n -g '!docs/handoffs/**' '[[:blank:]]+$' .github .gitignore AGENTS.md README.md SECURITY.md STRATEGY.md bin config deploy docs tests; test $? -eq 1
 ```
 
 Inspect every repository-relative Markdown link after changing documentation.
-The [current plan's verification contract](docs/plans/2026-08-14-001-docs-repository-foundation-plan.md#verification-contract)
-contains the complete Milestone 1 gates. When a later milestone introduces a
-real toolchain, add its project commands together with that toolchain and its
-evidence policy.
+The [current plan's verification contract](docs/plans/2026-08-14-0647-feat-pinned-local-development-environment-plan.md#verification-contract)
+contains the complete local-profile gates. A local passing result has only the
+scope recorded in the
+[compatibility ledger](docs/dependencies/compatibility/local-development.md).
 
 Before describing work as complete, apply the shared
 [definition of done](docs/project/definition-of-done.md). This file does not

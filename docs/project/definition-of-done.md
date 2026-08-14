@@ -13,7 +13,7 @@ duplicating them.
 - Acceptance scenarios cover the intended outcome, meaningful boundaries, and
   relevant failure behavior. Evidence links show the observed result.
 - Open decisions remain visible. The change does not silently select a public
-  API style, database topology, privacy jurisdiction, retention period,
+  API style, database topology, exact residency-jurisdiction profile, retention period,
   deployment mechanism, runtime version, or another deferred choice.
 - The final file and behavior scope matches the approved plan; abandoned
   experiments, placeholder structures, and hidden follow-up work are removed.
@@ -42,8 +42,9 @@ duplicating them.
   environment under review. Test doubles alone do not support real-component
   compatibility claims.
 - Real formatting, static-analysis, build, and test commands run when an
-  approved toolchain provides them. Before then, documentation and repository
-  checks are used without inventing commands or claiming unavailable gates.
+  approved toolchain provides them. A toolchain-specific passing result is not
+  generalized to absent application, production, platform, or architecture
+  gates; unavailable commands are neither invented nor claimed.
 
 ## Security, privacy, and secrets
 

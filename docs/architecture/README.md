@@ -127,6 +127,7 @@ metadata.
 | [0005](decisions/0005-optional-hydra-profile.md) | Make Hydra an optional deployment profile | 2026-08-14 |
 | [0006](decisions/0006-exclude-oathkeeper-and-keto.md) | Exclude Oathkeeper and Keto | 2026-08-14 |
 | [0007](decisions/0007-upstream-upgrade-independence.md) | Keep upstream components independently upgradeable | 2026-08-14 |
+| [0008](decisions/0008-docker-compose-local-development-profile.md) | Use Docker Compose for the local development profile | 2026-08-14 |
 
 ### Active proposals
 

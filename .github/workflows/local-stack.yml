@@ -1,0 +1,61 @@
+name: Local stack compatibility
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: local-stack-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  local-stack:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out the pull request
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Record the runner tuple
+        run: |
+          uname -a
+          docker version
+          docker compose version
+
+      - name: Verify shell and workflow contracts
+        run: |
+          shellcheck bin/local-stack tests/integration/local_stack/*.sh
+          tests/integration/local_stack/workflow_test.sh
+          tests/integration/local_stack/init_test.sh
+          tests/integration/local_stack/config_test.sh
+          tests/integration/local_stack/deadline_signal_test.sh
+          tests/integration/local_stack/startup_deadline_test.sh
+          tests/integration/local_stack/bootstrap_test.sh
+          tests/integration/local_stack/lifecycle_test.sh
+          tests/integration/local_stack/startup_failure_test.sh
+
+      - name: Exercise the real pinned profile
+        run: |
+          bin/local-stack init
+          bin/local-stack up
+          bin/local-stack smoke
+          bin/local-stack status
+          bin/local-stack down
+          bin/local-stack up
+          bin/local-stack smoke
+          tests/integration/local_stack/post_reset_test.sh
+
+      - name: Remove the exact local profile
+        if: always()
+        run: |
+          if [ -e deploy/local/.local-stack-state.json ] || [ -L deploy/local/.local-stack-state.json ]; then
+            bin/local-stack reset --yes
+          elif [ -e deploy/local/.local-stack-credentials.env ] || [ -L deploy/local/.local-stack-credentials.env ]; then
+            printf '%s\n' 'Unsafe credential-only local state requires investigation.' >&2
+            exit 1
+          fi

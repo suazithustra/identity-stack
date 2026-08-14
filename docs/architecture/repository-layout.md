@@ -54,17 +54,20 @@ makes one of these boundaries concrete.
 
 | Concern | Target path | Accountable owner | Boundary |
 | --- | --- | --- | --- |
+| Local operator tooling | `bin/` | Local-profile maintainers | Guarded, documented repository operator entry points for approved local capabilities. Scripts own context, ordering, state, failure, and cleanup semantics for their profile; this is not a generic script collection or an application API. |
 | Control-plane application | `apps/control_plane/` | Control-plane maintainers | Project-owned shared platform behavior in one modular-monolith deployable; not human credential authority, authorization policy evaluation, or consuming-application product behavior. |
 | Shared Elixir packages | `packages/elixir/` | Control-plane maintainers | Reusable Elixir code with demonstrated use across owned modules or applications; not a speculative extension framework. |
 | Upstream service configuration | `config/upstream/kratos/`, `config/upstream/spicedb/`, and optional `config/upstream/hydra/` | Component integration maintainers | Supported configuration for separately deployed, unmodified upstream services; no vendored or patched upstream source. |
 | SpiceDB relationship schemas | `schemas/spicedb/` | Authorization model maintainers with consuming-application domain owners | Versioned relationships and permissions. Consuming applications still own placement and enforcement of checks for their protected operations. |
-| Cross-boundary test suites | `tests/contract/`, `tests/integration/`, `tests/migration/`, and `tests/e2e/` | Maintainers of the boundary under test | Evidence across owned boundaries. Unit tests remain beside their owning code unless a later toolchain establishes another convention. |
-| Deployment assets | `deploy/` | Deployment maintainers | Realm-scoped packaging and environment composition once selected; no production packaging or provider is chosen by this layout. |
+| Cross-boundary test suites | `tests/contract/`, `tests/integration/`, `tests/migration/`, and `tests/e2e/` | Maintainers of the boundary under test | Evidence across owned boundaries. `tests/integration/local_stack/` owns the current local component fixtures and smoke harness; unit tests remain beside their owning code unless a later toolchain establishes another convention. |
+| Deployment assets | `deploy/` | Deployment maintainers | `deploy/local/` owns the current Docker Compose local/test profile. No production packaging or provider is chosen by that profile or this layout. |
 | Operational runbooks | `docs/runbooks/` | Operators of the documented capability | Recovery, upgrade, rollback or restore, incident, and routine operational procedures backed by the deployed profile. |
 | Implementation plans | `docs/plans/` | Author and reviewers of the planned change | Reviewable, time-bounded execution plans and their acceptance traceability. |
 | Security process and scoped models | `docs/security/` | Security reviewer and change owner | Threat-modeling process, templates, and scoped models. Secrets-handling rules remain in the policy directory. |
+| Dependency inventory and compatibility evidence | `docs/dependencies/` | Component integration maintainers and evidence reviewers | Exact artifact identities, provenance and license dispositions, architecture scope, and reviewed compatibility results. Evidence describes only the named tuple and cannot be self-certified by contributor-controlled execution. |
 | Repository policies | `docs/policies/` | Repository maintainers and named subject owner | Durable cross-cutting requirements for dependencies, secrets, and testing. |
 | Architecture decisions | `docs/architecture/decisions/` | Named decision-makers | Accepted constraints, alternatives, consequences, fitness checks, and explicit supersession history. |
+| Repository automation | `.github/workflows/` | Repository automation maintainers with the evidence owner for each workflow | Least-privilege automation for real repository gates. A workflow owns its event, permissions, immutable action identities, secret boundary, retained output, cleanup, and reviewer-bound evidence; it does not approve or certify its own change. |
 
 Consuming applications own their product data, workflows, domain rules,
 application profiles, organization behavior, and application-code
